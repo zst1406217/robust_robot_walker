@@ -141,4 +141,19 @@ Please refer to the [Deploy.md](./Deploy.md) for instructions on deploying to a 
 https://github.com/leggedrobotics/legged_gym<br>
 https://github.com/ZiwenZhuang/parkour
 
+## Citation
+
+You can find our paper on [arXiv](https://arxiv.org/abs/2409.07409).
+
+If you find this code or find the paper useful for your research, please consider citing:
+
+```
+@article{zhu2024robust,
+  title={Robust Robot Walker: Learning Agile Locomotion over Tiny Traps},
+  author={Shaoting, Zhu and Runhan, Huang and Linzhan, Mou and Hang, Zhao},
+  journal={arXiv preprint arXiv:2409.07409},
+  year={2024}
+}
+```
+
 ---
