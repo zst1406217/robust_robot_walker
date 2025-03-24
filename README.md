@@ -78,7 +78,7 @@ cd legged_gym
 
 2. The trained policy is stored in `checkpoint.zip`. Unzip it and place the folder in `legged_gym/logs/rrw_a1`.
 
-3. Make sure you're in the `robust-robot-walker/legged_gym` directory, and run the benchmark:
+3. Make sure you're in the `robust_robot_walker/legged_gym` directory, and run the benchmark:
 
 ```bash
 python legged_gym/scripts/track.py --task a1_bartrack --load_run checkpoint --headless
@@ -96,7 +96,7 @@ To train the walking policy on a flat plane:
 cd legged_gym
 ```
 
-Ensure you are in the `robust-robot-walker/legged_gym` directory, and then run:
+Ensure you are in the `robust_robot_walker/legged_gym` directory, and then run:
 
 ```bash
 python legged_gym/scripts/train.py --task a1_remotegoal --headless
@@ -111,7 +111,7 @@ python legged_gym/scripts/train.py --task a1_remotegoal --headless
    load_run = "Mar14_12-59-47_WalkByRemoteGoal_noResume"
    ```
 
-2. Make sure you're in the `robust-robot-walker/legged_gym` folder and run:
+2. Make sure you're in the `robust_robot_walker/legged_gym` folder and run:
 
 ```bash
 python legged_gym/scripts/train.py --task a1_mixgoalstage1 --headless
