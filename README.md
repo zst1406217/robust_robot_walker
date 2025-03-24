@@ -45,8 +45,8 @@ cd examples && python 1080_balls_of_solitude.py
 Clone the repository with the following command:
 
 ```bash
-git clone https://github.com/zst1406217/robust-robot-walker.git
-cd robust-robot-walker
+git clone https://github.com/zst1406217/robust_robot_walker.git
+cd robust_robot_walker
 ```
 
 ### 5. Install `rsl_rl` (PPO Implementation)
