@@ -141,6 +141,8 @@ def load_walk_policy(env, model_dir):
             num_dim+=4
         if "calf" in config_dict["asset"]["collision_body_names"]:
             num_dim+=4
+        if "hip" in config_dict["asset"]["collision_body_names"]:
+            num_dim+=4
         if "base" in config_dict["asset"]["collision_body_names"]:
             num_dim+=1
         config_dict["policy"]["num_stumble"]=num_dim
