@@ -441,7 +441,7 @@ class UnitreeA1Real:
             # robot shape friction
             segments["robot_friction"] = (1,)
         if "stumble_state" in components:
-            segments["stumble_state"] = (13,)
+            segments["stumble_state"] = (17,)
         return segments
         
     def get_num_obs_from_components(self, components):
@@ -463,7 +463,7 @@ class UnitreeA1Real:
         if "robot_friction" in components:
             segments["robot_friction"] = (1,)
         if "stumble_state" in components:
-            segments["stumble_state"] = (13,)
+            segments["stumble_state"] = (17,)
         return segments
     
     def get_num_estimated_from_components(self, components):

@@ -30,7 +30,6 @@
 
 from collections import namedtuple
 import torch
-import numpy as np
 
 from rsl_rl.utils import split_and_pad_trajectories
 from rsl_rl.utils.collections import is_namedarraytuple
@@ -53,6 +52,8 @@ class RolloutStorage:
             self.estimator_hidden_states = None
             self.latent = None
             self.use_gt = None
+            self.transition = None
+            self.env_classify = None
         
         def clear(self):
             self.__init__()
@@ -72,20 +73,21 @@ class RolloutStorage:
         "masks",
         "estimator_masks",
         "latent",
-        "use_gt"
+        "use_gt",
+        "transition",
+        "env_classify",
     ])
 
-    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, device='cpu'):
+    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, latent_shape, use_gt_shape, transition_shape, device='cpu'):
 
         self.device = device
 
         self.obs_shape = obs_shape
         self.privileged_obs_shape = privileged_obs_shape
         self.actions_shape = actions_shape
-        latent_shape = [36]
-        use_gt_shape = [1]
         self.latent_shape = latent_shape
         self.use_gt_shape = use_gt_shape
+        self.transition_shape = transition_shape
 
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
@@ -97,6 +99,7 @@ class RolloutStorage:
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.latent = torch.zeros(num_transitions_per_env, num_envs, *latent_shape, device=self.device)
         self.use_gt = torch.zeros(num_transitions_per_env, num_envs, *use_gt_shape, device=self.device)
+        self.transition = torch.zeros(num_transitions_per_env, num_envs, *transition_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
         # For PPO
@@ -109,10 +112,9 @@ class RolloutStorage:
 
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
+        self.env_classify = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # rnn
-        # self.saved_hidden_states_a = None
-        # self.saved_hidden_states_c = None
         self.saved_hidden_states = None
         self.saved_estimator_hidden_states = None
 
@@ -126,6 +128,26 @@ class RolloutStorage:
         self.actions[self.step].copy_(transition.actions)
         self.latent[self.step].copy_(transition.latent)
         self.use_gt[self.step].copy_(transition.use_gt)
+        self.transition[self.step].copy_(transition.transition)
+        self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        self.values[self.step].copy_(transition.values)
+        self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
+        self.mu[self.step].copy_(transition.action_mean)
+        self.sigma[self.step].copy_(transition.action_sigma)
+        self._save_hidden_states(transition.hidden_states)
+        self._save_estimator_hidden_states(transition.estimator_hidden_states)
+        self.step += 1
+
+    def add_transitions_rnn(self, transition: Transition):
+        if self.step >= self.num_transitions_per_env:
+            raise AssertionError("Rollout buffer overflow")
+        self.observations[self.step].copy_(transition.observations)
+        if self.privileged_observations is not None: self.privileged_observations[self.step].copy_(transition.critic_observations)
+        self.actions[self.step].copy_(transition.actions)
+        self.latent[self.step].copy_(transition.latent)
+        self.use_gt[self.step].copy_(transition.use_gt)
+        self.transition[self.step].copy_(transition.transition)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
         self.values[self.step].copy_(transition.values)
@@ -146,20 +168,9 @@ class RolloutStorage:
             except AttributeError as e:
                 if "NoneType" in str(e):
                     return
-        # # make a tuple out of GRU hidden state sto match the LSTM format
-        # hid_a = hidden_states[0] if isinstance(hidden_states[0], tuple) else (hidden_states[0],)
-        # hid_c = hidden_states[1] if isinstance(hidden_states[1], tuple) else (hidden_states[1],)
 
-        # initialize if needed 
-        # if self.saved_hidden_states_a is None:
-            # self.saved_hidden_states_a = [torch.zeros(self.observations.shape[0], *hid_a[i].shape, device=self.device) for i in range(len(hid_a))]
-            # self.saved_hidden_states_c = [torch.zeros(self.observations.shape[0], *hid_c[i].shape, device=self.device) for i in range(len(hid_c))]
         if self.saved_hidden_states is None:
             self.saved_hidden_states = buffer_from_example(hidden_states, self.observations.shape[0])
-        # copy the states
-        # for i in range(len(hid_a)):
-        #     self.saved_hidden_states_a[i][self.step].copy_(hid_a[i])
-        #     self.saved_hidden_states_c[i][self.step].copy_(hid_c[i])
         self.saved_hidden_states[self.step] = hidden_states
         
     def _save_estimator_hidden_states(self, estimator_hidden_states):
@@ -171,9 +182,9 @@ class RolloutStorage:
             except AttributeError as e:
                 if "NoneType" in str(e):
                     return
-        if self.saved_hidden_states is None:
-            self.saved_hidden_states = buffer_from_example(estimator_hidden_states, self.observations.shape[0])
-        self.saved_hidden_states[self.step] = estimator_hidden_states
+        if self.saved_estimator_hidden_states is None:
+            self.saved_estimator_hidden_states = buffer_from_example(estimator_hidden_states, self.observations.shape[0])
+        self.saved_estimator_hidden_states[self.step] = estimator_hidden_states
 
     def clear(self):
         self.step = 0
@@ -220,8 +231,6 @@ class RolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
-        # hid = self.saved_estimator_hidden_states[0] if len(self.saved_estimator_hidden_states)==1 else self.saved_estimator_hidden_states
-        # hid = [hid_.squeeze(1).flatten(0, 1) for hid_ in hid]
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -242,7 +251,7 @@ class RolloutStorage:
                 # hid_batch = hid[batch_idx].unsqueeze(0)
                 yield RolloutStorage.MiniBatch(
                     obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
-                    old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, ActorCriticHiddenState(None, None), None, None, None, None, None
+                    old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, ActorCriticHiddenState(None, None), None, None, None, None, None, None,None
                 )
 
     # for RNNs only
@@ -284,10 +293,6 @@ class RolloutStorage:
                 # then take only time steps after dones (flattens num envs and time dimensions),
                 # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
                 last_was_done = last_was_done.permute(1, 0)
-                # hid_a_batch = [ saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj].transpose(1, 0).contiguous()
-                                # for saved_hidden_states in self.saved_hidden_states_a ] 
-                # hid_c_batch = [ saved_hidden_states.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj].transpose(1, 0).contiguous()
-                                # for saved_hidden_states in self.saved_hidden_states_c ]
                 hid_batch = buffer_method(
                     buffer_method(
                         buffer_method(self.saved_hidden_states, "permute", 2, 0, 1, 3)[last_was_done][first_traj:last_traj],
@@ -296,13 +301,9 @@ class RolloutStorage:
                     "contiguous",
                 )
 
-                # remove the tuple for GRU
-                # hid_a_batch = hid_a_batch[0] if len(hid_a_batch)==1 else hid_a_batch
-                # hid_c_batch = hid_c_batch[0] if len(hid_c_batch)==1 else hid_a_batch
-
                 yield RolloutStorage.MiniBatch(
                     obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, \
-                    old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, hid_batch, None, masks_batch, None, None, None
+                    old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, hid_batch, None, masks_batch, None, None, None, None
                 )
                 
                 first_traj = last_traj
@@ -337,6 +338,8 @@ class RolloutStorage:
                 actions_batch = self.actions[:, start:stop].flatten(0, 1)
                 latent_batch = self.latent[:, start:stop].flatten(0, 1)
                 use_gt_batch = self.use_gt[:, start:stop].flatten(0, 1)
+
+                transition_batch = self.transition[:, start:stop].flatten(0,1)
                 old_mu_batch = self.mu[:, start:stop].flatten(0, 1)
                 old_sigma_batch = self.sigma[:, start:stop].flatten(0, 1)
                 returns_batch = self.returns[:, start:stop].flatten(0, 1)
@@ -344,9 +347,65 @@ class RolloutStorage:
                 values_batch = self.values[:, start:stop].flatten(0, 1)
                 old_actions_log_prob_batch = self.actions_log_prob[:, start:stop].flatten(0, 1)
 
-                # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
-                # then take only time steps after dones (flattens num envs and time dimensions),
-                # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
+                last_was_done = last_was_done.permute(1, 0)
+                estimator_hid_batch = buffer_method(
+                    buffer_method(
+                        buffer_method(self.saved_estimator_hidden_states, "permute", 2, 0, 1, 3)[last_was_done][first_traj:last_traj],
+                        "transpose", 1, 0
+                    ),
+                    "contiguous",
+                )
+
+                yield RolloutStorage.MiniBatch(
+                    obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, \
+                    old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, None, estimator_hid_batch, None, masks_batch, latent_batch, use_gt_batch, transition_batch
+                )
+                
+                first_traj = last_traj
+
+    # for estimator + rnn actor only
+    def estimator_recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
+
+        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
+        if self.privileged_observations is not None: 
+            padded_critic_obs_trajectories, _ = split_and_pad_trajectories(self.privileged_observations, self.dones)
+        else: 
+            padded_critic_obs_trajectories = padded_obs_trajectories
+        padded_latent, _ = split_and_pad_trajectories(self.latent, self.dones)
+        padded_use_gt, _ = split_and_pad_trajectories(self.use_gt, self.dones)
+
+        mini_batch_size = self.num_envs // num_mini_batches
+        for ep in range(num_epochs):
+            first_traj = 0
+            for i in range(num_mini_batches):
+                start = i*mini_batch_size
+                stop = (i+1)*mini_batch_size
+
+                dones = self.dones.squeeze(-1)
+                last_was_done = torch.zeros_like(dones, dtype=torch.bool)
+                last_was_done[1:] = dones[:-1]
+                last_was_done[0] = True
+                trajectories_batch_size = torch.sum(last_was_done[:, start:stop])
+                last_traj = first_traj + trajectories_batch_size
+                
+                masks_batch = trajectory_masks[:, first_traj:last_traj]
+                obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
+                critic_obs_batch = padded_critic_obs_trajectories[:, first_traj:last_traj]
+
+                actions_batch = self.actions[:, start:stop]
+                latent_batch = padded_latent[:, first_traj:last_traj]
+                use_gt_batch = padded_use_gt[:, first_traj:last_traj]
+
+                transition_batch = self.transition[:, start:stop].flatten(0, 1)
+                old_mu_batch = self.mu[:, start:stop]
+                old_sigma_batch = self.sigma[:, start:stop]
+                returns_batch = self.returns[:, start:stop]
+                advantages_batch = self.advantages[:, start:stop]
+                values_batch = self.values[:, start:stop]
+                old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
+
+                env_classify_batch = self.env_classify[:, start:stop]
+
                 last_was_done = last_was_done.permute(1, 0)
                 hid_batch = buffer_method(
                     buffer_method(
@@ -356,9 +415,17 @@ class RolloutStorage:
                     "contiguous",
                 )
 
+                estimator_hid_batch = buffer_method(
+                    buffer_method(
+                        buffer_method(self.saved_estimator_hidden_states, "permute", 2, 0, 1, 3)[last_was_done][first_traj:last_traj],
+                        "transpose", 1, 0
+                    ),
+                    "contiguous",
+                )
+
                 yield RolloutStorage.MiniBatch(
                     obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, \
-                    old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, None, hid_batch, None, masks_batch, latent_batch, use_gt_batch
+                    old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, hid_batch, estimator_hid_batch, masks_batch, masks_batch, latent_batch, use_gt_batch, transition_batch, env_classify_batch
                 )
                 
                 first_traj = last_traj
@@ -447,16 +514,6 @@ class QueueRolloutStorage(RolloutStorage):
             torch.zeros(expand_size, self.num_envs, *self.actions_shape, device=self.device),
         ], dim= 0).contiguous()
 
-        # For hidden_states
-        # if not self.saved_hidden_states_a is None:
-        #     self.saved_hidden_states_a = [ torch.cat([
-        #         saved_hidden_states,
-        #         torch.zeros(expand_size, *saved_hidden_states.shape[1:], device=self.device),
-        #     ], dim= 0).contiguous() for saved_hidden_states in self.saved_hidden_states_a ]
-        #     self.saved_hidden_states_c = [ torch.cat([
-        #         saved_hidden_states,
-        #         torch.zeros(expand_size, *saved_hidden_states.shape[1:], device=self.device),
-        #     ], dim= 0).contiguous() for saved_hidden_states in self.saved_hidden_states_c ]
         if not self.saved_hidden_states is None:
             self.saved_hidden_states = buffer_expand(
                 self.saved_hidden_states,
@@ -587,7 +644,6 @@ class ActionLabelRollout(QueueRolloutStorage):
                     obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
                     old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, action_label_batch,
                 )
-
 
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
         mini_batch_size = self.num_envs // num_mini_batches

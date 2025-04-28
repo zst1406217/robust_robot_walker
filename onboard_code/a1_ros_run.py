@@ -9,84 +9,8 @@ from functools import partial
 from typing import Tuple
 
 import rospy
-from std_msgs.msg import Float32MultiArray
-from std_msgs.msg import Int8
-from sensor_msgs.msg import Image
-import ros_numpy
-
-from geometry_msgs.msg import Twist
-from a1_real import UnitreeA1Real, resize2d
 from rsl_rl import modules
-from rsl_rl.utils.utils import get_obs_slice
 
-from sensor_msgs.msg import Image as msg_Image
-from sensor_msgs.msg import CameraInfo
-import sys
-import pyrealsense2 as rs2
-from std_msgs.msg import Float32MultiArray
-
-@torch.no_grad()
-def handle_forward_depth(ros_msg, model, publisher, output_resolution, device):
-    """ The callback function to handle the forward depth and send the embedding through ROS topic """
-    buf = ros_numpy.numpify(ros_msg).astype(np.float32)
-    forward_depth_buf = resize2d(
-        torch.from_numpy(buf).unsqueeze(0).unsqueeze(0).to(device),
-        output_resolution,
-    )
-    embedding = model(forward_depth_buf)
-    ros_data = embedding.reshape(-1).cpu().numpy().astype(np.float32)
-    publisher.publish(Float32MultiArray(data= ros_data.tolist()))
-
-class ImageListener:
-    def __init__(self, topic):
-        self.topic = topic
-        self.sub = rospy.Subscriber(topic, msg_Image, self.imageDepthCallback)
-        self.sub_request = rospy.Subscriber('/axis_pub', Float32MultiArray, self.request_callback)
-        self.sub_info = rospy.Subscriber('/camera_down/aligned_depth_to_color/camera_info', CameraInfo, self.imageDepthInfoCallback)
-        self.pub_request = rospy.Publisher('/depth_axis', Float32MultiArray, queue_size=1)
-        self.msg=Float32MultiArray()
-        self.intrinsics = None
-        self.height = None
-        self.width = None
-
-    def imageDepthCallback(self, data):
-        self.cv_image = np.frombuffer(data.data, dtype=np.uint16).reshape(data.height,data.width)
-        if self.height==None:
-            print("camera_OK")
-        self.height=data.height
-        self.width=data.width
-
-    def request_callback(self, data):
-        array=data.data
-        pix_x=round(self.width*(array[0]+array[2])/2)
-        # pix_y=round(self.height*(array[1]+array[3])/2)
-        pix_y=round(self.height*array[3])
-        pix=[pix_x,pix_y]
-        print("OK1")
-        if self.intrinsics:
-            print("OK2")
-            depth = self.cv_image[pix[1], pix[0]]
-            result = rs2.rs2_deproject_pixel_to_point(self.intrinsics, [pix[0], pix[1]], depth)
-            result=[result[0]/1000., result[1]/1000., result[2]/1000.]
-            self.msg.data=result
-            self.pub_request.publish(self.msg)
-
-    def imageDepthInfoCallback(self, cameraInfo):
-        # import pdb; pdb.set_trace()
-        if self.intrinsics:
-            return
-        self.intrinsics = rs2.intrinsics()
-        self.intrinsics.width = cameraInfo.width
-        self.intrinsics.height = cameraInfo.height
-        self.intrinsics.ppx = cameraInfo.K[2]
-        self.intrinsics.ppy = cameraInfo.K[5]
-        self.intrinsics.fx = cameraInfo.K[0]
-        self.intrinsics.fy = cameraInfo.K[4]
-        if cameraInfo.distortion_model == 'plumb_bob':
-            self.intrinsics.model = rs2.distortion.brown_conrady
-        elif cameraInfo.distortion_model == 'equidistant':
-            self.intrinsics.model = rs2.distortion.kannala_brandt4
-        self.intrinsics.coeffs = [i for i in cameraInfo.D]
 
 class StandOnlyModel(torch.nn.Module):
     def __init__(self, action_scale, dof_pos_scale, tolerance= 0.1, delta= 0.1):
@@ -227,10 +151,6 @@ class SkilledA1Real(UnitreeA1Real):
 def main(args):
     log_level = rospy.DEBUG if args.debug else rospy.INFO
     rospy.init_node("a1_legged_gym_" + "upboard", log_level= log_level)
-    topic = '/camera_down/aligned_depth_to_color/image_raw'
-    listener = ImageListener(topic)
-    terrain_pub=rospy.Publisher('terrain_class', Int8, queue_size=1)
-    terrain_data=Int8()
 
     with open(osp.join(args.walkdir, "config.json"), "r") as f:
         config_dict = json.load(f, object_pairs_hook= OrderedDict)

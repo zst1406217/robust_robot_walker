@@ -29,14 +29,9 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 from .actor_critic import ActorCritic
-from .actor_critic_encode import ActorCriticEncode
-# from .actor_critic_moe import ActorCriticMoe
 from .actor_critic_recurrent import ActorCriticRecurrent
-from .visual_actor_critic import VisualDeterministicRecurrent, VisualDeterministicAC
-from .actor_critic_mutex import ActorCriticMutex
-from .actor_critic_field_mutex import ActorCriticFieldMutex, ActorCriticClimbMutex
 from .estimator import Estimator
-# from .discriminator import Discriminator
+from .discriminator import Discriminator
 
 def build_actor_critic(env, policy_class_name, policy_cfg):
     """ NOTE: This method allows to hack the policy kwargs by adding the env attributes to the policy_cfg. """
@@ -58,6 +53,18 @@ def build_actor_critic(env, policy_class_name, policy_cfg):
     if not "num_actions" in policy_cfg:
         policy_cfg["num_actions"] = env.num_actions
     policy_cfg["num_scan"]=len(env.cfg.terrain.measured_points_x)*len(env.cfg.terrain.measured_points_y)
+    num_dim = 0
+    if "foot" in env.cfg.asset.collision_body_names:
+        num_dim += 4
+    if "hip" in env.cfg.asset.collision_body_names:
+        num_dim += 4
+    if "thigh" in env.cfg.asset.collision_body_names:
+        num_dim += 4
+    if "calf" in env.cfg.asset.collision_body_names:
+        num_dim += 4
+    if "base" in env.cfg.asset.collision_body_names:
+        num_dim += 1
+    policy_cfg["num_stumble"]=num_dim
     policy_cfg["num_estimated"]=env.num_estimated
 
     actor_critic: ActorCritic = actor_critic_class(**policy_cfg)

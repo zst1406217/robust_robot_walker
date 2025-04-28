@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 
 def get_activation_Cls(activation_name):

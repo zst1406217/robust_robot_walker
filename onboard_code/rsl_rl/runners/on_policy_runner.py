@@ -44,38 +44,64 @@ from rsl_rl.env import VecEnv
 class OnPolicyRunner:
 
     def __init__(self,
-                 env: VecEnv,
-                 train_cfg,
-                 log_dir=None,
-                 device='cpu'):
+                env: VecEnv,
+                train_cfg,
+                log_dir=None,
+                device='cpu'):
 
         self.cfg=train_cfg["runner"]
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
         self.estimator_cfg = train_cfg["estimator"]
+        self.discriminator_cfg = train_cfg["discriminator"]
         self.device = device
         self.env = env
-
+        
         actor_critic = modules.build_actor_critic(
             self.env,
             self.cfg["policy_class_name"],
             self.policy_cfg,
         ).to(self.device)
         
-        estimator = modules.Estimator(input_dim=self.estimator_cfg["input_dim"], output_dim=self.estimator_cfg["priv_states_dim"], 
-                                      rnn_type=self.estimator_cfg["rnn_type"],rnn_hidden_size=self.estimator_cfg["rnn_hidden_size"],
-                                      latent_encoder_hidden_dims=self.estimator_cfg["latent_encoder_hidden_dims"]).to(self.device)
-
-        alg_class = getattr(algorithms, self.cfg["algorithm_class_name"]) # PPO
-        self.alg: algorithms.PPO = alg_class(actor_critic, estimator, self.estimator_cfg, device=self.device, **self.alg_cfg)
+        estimator = modules.Estimator(input_dim=self.estimator_cfg["input_dim"], output_dim=actor_critic.estimator_output_dim, 
+                                    rnn_type=self.estimator_cfg["rnn_type"],rnn_hidden_size=self.estimator_cfg["rnn_hidden_size"],
+                                    latent_encoder_hidden_dims=self.estimator_cfg["latent_encoder_hidden_dims"]).to(self.device)
         
+        if hasattr(actor_critic.actor, "num_props"):
+            actor_critic.actor.num_props=3+self.estimator_cfg["input_dim"]
+        else:
+            actor_critic.num_props=3+self.estimator_cfg["input_dim"]
+
+        discriminator = modules.Discriminator(state_size=self.discriminator_cfg["state_size"], hidden_sizes=self.discriminator_cfg["hidden_sizes"])
+        
+        alg_class = getattr(algorithms, self.cfg["algorithm_class_name"]) # PPO
+        self.alg: algorithms.PPO = alg_class(actor_critic, estimator, discriminator, self.estimator_cfg, self.discriminator_cfg, device=self.device, **self.alg_cfg)
+
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
+        
+        self.amp_reward_coeff = self.cfg.get("amp_reward_coeff", 0.)
+        self.class_loss_coeff = self.estimator_cfg.get("class_loss_coeff", 0.)
+        self.num_estimator_train_step = self.cfg.get("num_estimator_train_step", False)
+        self.stage = self.cfg.get("stage", False)
+        self.learn = self.learn_RL
+        
         self.save_interval = self.cfg["save_interval"]
         self.estimator_decay = self.estimator_cfg["estimator_decay"]
 
         # init storage and model
-        self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs], [self.env.num_actions])
-
+        self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs], [self.env.num_actions],
+                            [actor_critic.estimator_output_dim], [1], [self.discriminator_cfg["state_size"]*2])
+        
+        terrain_types=self.env.terrain_types.clone().detach().to(self.device)
+        if self.class_loss_coeff>0:
+            col_class = self.estimator_cfg["col_class"]
+            mapping_list = []
+            for idx, count in enumerate(col_class):
+                mapping_list.extend([idx] * count)
+            mapping = torch.tensor(mapping_list, device=self.device)
+            terrain_types = mapping[terrain_types.long().view(-1)].view(terrain_types.shape)
+            torch.set_printoptions(profile="full")
+            self.alg.storage.env_classify[:,:,0]=terrain_types
         # Log
         self.log_dir = log_dir
         self.writer = None
@@ -86,7 +112,7 @@ class OnPolicyRunner:
 
         _, _ = self.env.reset()
     
-    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+    def learn_RL(self, num_learning_iterations, init_at_random_ep_len=False):
         # initialize writer
         if self.log_dir is not None and self.writer is None:
             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
@@ -151,11 +177,20 @@ class OnPolicyRunner:
             self.estimator_iteration = self.estimator_iteration + 1
             self.current_learning_iteration = self.current_learning_iteration + 1
         
-        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration))) 
 
     def rollout_step(self, obs, critic_obs):
         actions = self.alg.act(obs, critic_obs)
         obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
+        transition = self.env.transition_buf
+        self.alg.update_transition(transition)
+        with torch.inference_mode():
+            amp_score=self.alg.discriminator(transition)
+        amp_rew=torch.clip(1-0.25*(amp_score-1)**2, min=0)*self.amp_reward_coeff
+        amp_rew=amp_rew.squeeze(1)
+
+        rewards=rewards+amp_rew
+        infos['episode']['rew_amp']=amp_rew
         critic_obs = privileged_obs if privileged_obs is not None else obs
         obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
         self.alg.process_env_step(rewards, dones, infos)
@@ -208,44 +243,41 @@ class OnPolicyRunner:
 
         if len(locs['rewbuffer']) > 0:
             log_string = (f"""{'#' * width}\n"""
-                          f"""{str.center(width, ' ')}\n\n"""
-                          f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
+                        f"""{str.center(width, ' ')}\n\n"""
+                        f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                          f"""{'Value function loss:':>{pad}} {locs["losses"]['value_loss']:.4f}\n"""
-                          f"""{'Surrogate loss:':>{pad}} {locs["losses"]['surrogate_loss']:.4f}\n"""
-                          f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
-                          f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
-                          f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
-                        #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
-                        #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n"""
+                        f"""{'Value function loss:':>{pad}} {locs["losses"]['value_loss']:.4f}\n"""
+                        f"""{'Surrogate loss:':>{pad}} {locs["losses"]['surrogate_loss']:.4f}\n"""
+                        f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                        f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
+                        f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
                         )
         else:
             log_string = (f"""{'#' * width}\n"""
-                          f"""{str.center(width, ' ')}\n\n"""
-                          f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
+                        f"""{str.center(width, ' ')}\n\n"""
+                        f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                          f"""{'Value function loss:':>{pad}} {locs["losses"]['value_loss']:.4f}\n"""
-                          f"""{'Surrogate loss:':>{pad}} {locs["losses"]['surrogate_loss']:.4f}\n"""
-                          f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
-                        #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
-                        #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n"""
+                        f"""{'Value function loss:':>{pad}} {locs["losses"]['value_loss']:.4f}\n"""
+                        f"""{'Surrogate loss:':>{pad}} {locs["losses"]['surrogate_loss']:.4f}\n"""
+                        f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                         )
 
         log_string += ep_string
         log_string += (f"""{'-' * width}\n"""
-                       f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
-                       f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
-                       f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
-                       f"""{'ETA:':>{pad}} {self.tot_time / (self.current_learning_iteration + 1 - locs["start_iter"]) * (
-                               locs['tot_iter'] - self.current_learning_iteration):.1f}s\n""")
+                    f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
+                    f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
+                    f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
+                    f"""{'ETA:':>{pad}} {self.tot_time / (self.current_learning_iteration + 1 - locs["start_iter"]) * (
+                    locs['tot_iter'] - self.current_learning_iteration):.1f}s\n""")
         print(log_string)
-
+        
     def save(self, path, infos=None):
         run_state_dict = {
             'model_state_dict': self.alg.actor_critic.state_dict(),
             'estimator_state_dict': self.alg.estimator.state_dict(),
+            'discriminator_state_dict': self.alg.discriminator.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
-            # 'estimator_optimizer_state_dict': self.alg.estimator_optimizer.state_dict(),
+            'discriminator_optimizer_state_dict': self.alg.discriminator_optimizer.state_dict(),
             'iter': self.current_learning_iteration,
             'infos': infos,
         }
@@ -257,11 +289,11 @@ class OnPolicyRunner:
         loaded_dict = torch.load(path)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'],strict=False)
         if "estimator_state_dict" in loaded_dict:
-            self.alg.estimator.load_state_dict(loaded_dict['estimator_state_dict'])
-        # if load_optimizer and "optimizer_state_dict" in loaded_dict:
-        #     self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
-            # if "estimator_optimizer_state_dict" in loaded_dict:
-            #     self.alg.estimator_optimizer.load_state_dict(loaded_dict['estimator_optimizer_state_dict'])
+            self.alg.estimator.load_state_dict(loaded_dict['estimator_state_dict'], strict=False)
+        if "discriminator_state_dict" in loaded_dict:
+            self.alg.discriminator.load_state_dict(loaded_dict['discriminator_state_dict'], strict=False)
+        if "discriminator_optimizer_state_dict" in loaded_dict:
+            self.alg.discriminator_optimizer.load_state_dict(loaded_dict['discriminator_optimizer_state_dict'])
         if "lr_scheduler_state_dict" in loaded_dict:
             if not hasattr(self.alg, "lr_scheduler"):
                 print("Warning: lr_scheduler_state_dict found in checkpoint but no lr_scheduler in algorithm. Ignoring.")
@@ -270,6 +302,16 @@ class OnPolicyRunner:
         elif hasattr(self.alg, "lr_scheduler"):
             print("Warning: lr_scheduler_state_dict not found in checkpoint but lr_scheduler in algorithm. Ignoring.")
         self.current_learning_iteration = loaded_dict['iter']
+        return loaded_dict['infos']
+    
+    def load_actor(self, idx, path, load_optimizer=True):
+        loaded_dict = torch.load(path)
+        debug=self.alg.actor_critic.actor[idx].load_state_dict(loaded_dict['model_state_dict'],strict=False)
+        return loaded_dict['infos']
+    
+    def load_critic(self, idx, path, load_optimizer=True):
+        loaded_dict = torch.load(path)
+        self.alg.actor_critic.critic[idx].load_state_dict(loaded_dict['model_state_dict'],strict=False)
         return loaded_dict['infos']
 
     def get_inference_policy(self, device=None):
